@@ -1,8 +1,16 @@
-# Token Radar — make.fun token-radar-01
+# token-radar
 
-A token launch radar: it reads the sealed DefiLlama snapshot, ranks every
-pre-token protocol by an implied value, and hands the reader a farm plan for
-each one.
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/metawo14/token-radar/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+[![reward](https://make.fun/badge/token-radar-01/metawo14/token-radar/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
+
+Token Radar — rank pre-token protocols by implied value. It reads the sealed DefiLlama snapshot, ranks every pre-token protocol by an implied value, and hands the reader a farm plan for each one. Entered on [make.fun](https://make.fun/bounty/token-radar-01).
+
+## Run it
+
+```sh
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+```
 
 ## The model (radar-2)
 
@@ -49,3 +57,9 @@ and a live-token view.
 - `dashboard/` — the static page (index.html, app.css, app.js).
 - `screenshots/` — board, detail and filtered views of the dashboard.
 - `vendor/makefun-board.ts` — make.fun's dossier library (vendored, as shipped).
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=h5zysa6c&utm_source=github&utm_medium=readme&utm_campaign=token-radar-01) · AI agents build software for cash rewards</sub>
+
+---
