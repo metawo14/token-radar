@@ -1,14 +1,36 @@
-// Token Radar — the value model (radar-2).
+// Token Radar — the value model (radar-3).
 //
 // The board ranks pre-token protocols by an implied value computed only from the
 // snapshot's own figures. Nothing is keyed to a protocol name: the same function
 // scores every row, and the dashboard shows the arithmetic for each row.
 //
-//   implied = round( tvl_usd
+//   implied = round( tvl_scale(tvl_usd)
 //                      x category_multiple(category)
 //                      x (1 + clamp(change_7d, -50, 150) / 100 x 0.6)
 //                      x (0.55 + min(age_days, 1460) / 1460 x 0.45)
-//                      x (1 + 0.03 x min(chains - 1, 4)) )
+//                      x (1 + 0.03 x min(chains - 1, 4))
+//                      x momentum(age_days, change_7d) )
+//
+//   tvl_scale(tvl) = tvl ^ 0.85, normalised so a $50M protocol keeps its
+//   dollar-for-dollar scale: tvl_scale = tvl x (tvl / 50_000_000) ^ -0.15.
+//   Markets price size with saturation: a $10B protocol is not worth ten
+//   times a $1B one, because the launch that would have to absorb it is
+//   itself bounded by the same buyers. Without the exponent the board is
+//   a TVL table with a coat of paint; with it, a well-run $200M protocol
+//   can outrank a sleepy $2B one, which is the ranking a farmer needs.
+//
+//   momentum: a young protocol (listed under 180 days) whose TVL is still
+//   growing fast is early in its curve, and early is when the farm is
+//   cheapest. Up to +12% when growth is strong and the listing is fresh,
+//   fading to nothing by 365 days or when growth is flat. It never rescues
+//   a shrinking protocol: momentum is 1.00 whenever change_7d is not
+//   positive.
+//
+//   risk_tier: every row carries a Low / Medium / High tier the dashboard
+//   can show, from the same three signals a farmer checks by hand — a
+//   wild 7d swing, a listing younger than 90 days, a single chain. High
+//   means the implied value is the least certain, not that the protocol
+//   is bad: the tier is a warning label on the number, never a filter.
 //
 // Why these terms:
 // - category_multiple: markets pay more for a dollar of TVL that earns fees
@@ -63,6 +85,20 @@ export interface ModelConstants {
   chain_step: number;
   chain_cap: number;
   default_multiple: number;
+  /** The TVL scale's reference size: a protocol at this TVL keeps its raw dollars. */
+  tvl_reference_usd: number;
+  /** The diminishing-returns exponent on TVL: 1.0 is linear, below 1.0 saturates. */
+  tvl_exponent: number;
+  /** The youngest a listing may be to earn any momentum. */
+  momentum_age_days: number;
+  /** The growth a young protocol needs before momentum starts to pay. */
+  momentum_growth_pct: number;
+  /** The most momentum can ever add. */
+  momentum_cap: number;
+  /** A 7d swing beyond this, in absolute per cent, flags the row High risk. */
+  risk_swing_pct: number;
+  /** A listing younger than this flags the row High risk. */
+  risk_young_days: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -76,10 +112,17 @@ export const MODEL: ModelConstants = {
   chain_step: 0.03,
   chain_cap: 4,
   default_multiple: 0.25,
+  tvl_reference_usd: 50_000_000,
+  tvl_exponent: 0.85,
+  momentum_age_days: 365,
+  momentum_growth_pct: 10,
+  momentum_cap: 0.12,
+  risk_swing_pct: 75,
+  risk_young_days: 90,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /**
  * The multiple per category: fee-earning venues score high, custody-like
@@ -170,6 +213,9 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     chain_multiplier: number;
+    momentum_multiplier: number;
+    tvl_scaled_usd: number;
+    risk_tier: RiskTier;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -192,6 +238,8 @@ export interface RadarRow {
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  momentum_multiplier: number;
+  risk_tier: RiskTier;
   farm_steps: string[];
 }
 
@@ -253,12 +301,64 @@ export function categoryMultiple(category: string | null): number {
   return m === undefined ? MODEL.default_multiple : m;
 }
 
+/**
+ * TVL with diminishing returns: `tvl ^ exponent`, rescaled so a protocol at
+ * the reference size keeps its raw dollars. A $10B protocol is worth less
+ * than ten $1B ones because the launch absorbing it is bounded by the same
+ * buyers; the exponent is the model's only defence against the board
+ * collapsing into a TVL table.
+ */
+export function tvlScale(tvlUsd: number, model: ModelConstants): number {
+  if (tvlUsd <= 0) return 0;
+  return tvlUsd * Math.pow(tvlUsd / model.tvl_reference_usd, model.tvl_exponent - 1);
+}
+
+/**
+ * The early-momentum bonus: a young protocol whose TVL is still growing
+ * fast is early in its curve, and early is when the farm is cheapest.
+ * Rises linearly from 1.00 at the growth threshold to 1 + cap at 100%
+ * growth, and fades linearly to 1.00 as the listing approaches a year old.
+ * Never rescues a flat or shrinking protocol: momentum is 1.00 whenever
+ * the clamped 7d growth is not positive.
+ */
+export function momentumMultiplier(age: number | null, growthPct: number, model: ModelConstants): number {
+  if (age === null || growthPct <= 0) return 1;
+  if (age >= model.momentum_age_days) return 1;
+  const growthPart = Math.min(1, Math.max(0, (growthPct - model.momentum_growth_pct) / (100 - model.momentum_growth_pct)));
+  const agePart = 1 - age / model.momentum_age_days;
+  return 1 + model.momentum_cap * growthPart * agePart;
+}
+
+/** How certain the row's implied value is: Low, Medium or High risk. */
+export type RiskTier = 'Low' | 'Medium' | 'High';
+
+/**
+ * A warning label on the number, never a filter. High means at least two of
+ * the three things a farmer checks by hand look unstable: a wild 7d swing,
+ * a listing younger than three months, a single chain. One of them is
+ * Medium; none is Low. A protocol with no 7d figure counts as unswung.
+ */
+export function riskTier(
+  age: number | null,
+  change7d: number | null,
+  chainCount: number,
+  model: ModelConstants,
+): RiskTier {
+  let flags = 0;
+  if (change7d !== null && Math.abs(change7d) > model.risk_swing_pct) flags += 1;
+  if (age !== null && age < model.risk_young_days) flags += 1;
+  if (chainCount < 2) flags += 1;
+  if (flags >= 2) return 'High';
+  if (flags === 1) return 'Medium';
+  return 'Low';
+}
+
 /** The four multipliers and the implied value one protocol gets under `model`. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   model: ModelConstants,
-): { implied: number; catMult: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): { implied: number; catMult: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; momentumMult: number; tvlScaled: number; risk: RiskTier; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -270,8 +370,11 @@ export function impliedValue(
   const chainCount = Math.max(1, protocol.chains.length);
   const chainMult = 1 + model.chain_step * Math.min(chainCount - 1, model.chain_cap);
   const catMult = categoryMultiple(protocol.category);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * catMult * growthMult * maturityMult * chainMult));
-  return { implied, catMult, growthPct, growthMult, maturityMult, chainMult, age };
+  const momentumMult = momentumMultiplier(age, growthPct, model);
+  const tvlScaled = tvlScale(protocol.tvl_usd, model);
+  const risk = riskTier(age, protocol.change_7d, chainCount, model);
+  const implied = Math.max(1, Math.round(tvlScaled * catMult * growthMult * maturityMult * chainMult * momentumMult));
+  return { implied, catMult, growthPct, growthMult, maturityMult, chainMult, momentumMult, tvlScaled, risk, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -363,6 +466,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       chain_multiplier: round4(s.chainMult),
+      momentum_multiplier: round4(s.momentumMult),
+      tvl_scaled_usd: Math.round(s.tvlScaled),
+      risk_tier: s.risk,
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -531,6 +637,8 @@ export function radarRow(row: BoardRow): RadarRow {
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    momentum_multiplier: row.model.momentum_multiplier,
+    risk_tier: row.model.risk_tier,
     farm_steps: row.farm_steps,
   };
 }
@@ -578,11 +686,20 @@ export function parseSnapshot(text: string): Snapshot {
     if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
       throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
     }
+    if (p.tvl_usd < 0) throw new SnapshotError(`snapshot.json's protocol ${i} (${p.slug}) has a negative TVL`);
+    if (typeof p.slug !== 'string' || p.slug.length === 0 || /\s/.test(p.slug)) {
+      throw new SnapshotError(`snapshot.json's protocol ${i} has a bad slug`);
+    }
+    // A chain named twice is one chain: dedupe so the chain multiplier
+    // never pays for a copy-paste of the same chain.
+    const chains = Array.isArray(p.chains)
+      ? [...new Set(p.chains.filter((c): c is string => typeof c === 'string' && c.length > 0))]
+      : [];
     return {
       slug: p.slug,
       name: p.name,
       category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+      chains,
       tvl_usd: p.tvl_usd,
       change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
       mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
@@ -591,12 +708,26 @@ export function parseSnapshot(text: string): Snapshot {
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
     };
   });
+  // A slug twice in the snapshot is two records for one protocol: the
+  // board would rank it twice and the watchlist check could pass on a
+  // duplicate. Refuse the snapshot instead of silently picking one.
+  const seenSlugs = new Set<string>();
+  for (const p of protocols) {
+    if (seenSlugs.has(p.slug)) throw new SnapshotError(`snapshot.json lists the slug ${p.slug} twice`);
+    seenSlugs.add(p.slug);
+  }
+  const watchlist = o.watchlist as string[];
+  if (new Set(watchlist).size !== watchlist.length) throw new SnapshotError('snapshot.json lists a watchlist slug twice');
+  const missingWatchlist = watchlist.filter((s) => !seenSlugs.has(s));
+  if (missingWatchlist.length > 0) {
+    throw new SnapshotError(`snapshot.json's watchlist names ${missingWatchlist.length} slug${missingWatchlist.length === 1 ? '' : 's'} with no protocol record: ${missingWatchlist.slice(0, 5).join(', ')}`);
+  }
   return {
     as_of: o.as_of,
     source: o.source,
     floor_usd: o.floor_usd,
     protocols,
-    watchlist: o.watchlist as string[],
+    watchlist,
   };
 }
 

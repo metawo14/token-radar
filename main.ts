@@ -16,7 +16,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { MODEL, MODEL_VERSION, boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -54,6 +54,34 @@ mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 
+/**
+ * model.json: the model that scored this board, beside the board itself,
+ * so a reader can reproduce a row's implied value from the snapshot alone
+ * without reading the source. It names the version, every constant, the
+ * board's shape, and how the risk tiers fall across the rows.
+ */
+const riskCounts = { Low: 0, Medium: 0, High: 0 };
+for (const row of board) riskCounts[row.model.risk_tier] += 1;
+writeFileSync(
+  join(out, 'model.json'),
+  `${JSON.stringify(
+    {
+      model_version: MODEL_VERSION,
+      constants: MODEL,
+      board_rows: board.length,
+      watchlist_covered: snapshot.watchlist.length,
+      early_rows: radar.early_size,
+      live_rows: radar.live_size,
+      top_implied_value_usd: board.length > 0 ? board[0]!.implied_value_usd : 0,
+      risk_tiers: riskCounts,
+    },
+    null,
+    2,
+  )}\n`,
+);
+
+/** Every file this run owes /output, checked after writing so a silent disk failure cannot pass as a board. */
+
 /** Copy one directory's regular files into `to`, skipping names that start with a dot. */
 function copyFiles(from: string, to: string): string[] {
   if (!existsSync(from)) return [];
@@ -85,7 +113,35 @@ for (const name of shots) {
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
+/**
+ * Every file this run owes /output, checked after writing so a silent disk
+ * failure cannot pass as a board. The dossier is checked last of all: it is
+ * written last, and a board whose dossier never landed is not an entry.
+ */
+const owedFiles = ['board.json', 'data.js', 'model.json', 'dossier.json'];
+for (const name of owedFiles) {
+  const path = join(out, name);
+  if (!existsSync(path) || statSync(path).size === 0) {
+    process.stderr.write(`token radar: ${path} is missing or empty after writing\n`);
+    process.exit(1);
+  }
+}
+
+/** The board read back from disk, so the run proves what it wrote, not what it computed in memory. */
+const writtenBoard = JSON.parse(readFileSync(join(out, 'board.json'), 'utf8')) as { rows?: unknown };
+if (!Array.isArray(writtenBoard.rows) || writtenBoard.rows.length !== board.length) {
+  process.stderr.write(`token radar: board.json on disk holds ${Array.isArray(writtenBoard.rows) ? writtenBoard.rows.length : 'no'} rows, the model scored ${board.length}\n`);
+  process.exit(1);
+}
+const writtenTop = writtenBoard.rows[0] as { slug?: unknown; implied_value_usd?: unknown };
+if (writtenTop.slug !== board[0]!.slug || writtenTop.implied_value_usd !== board[0]!.implied_value_usd) {
+  process.stderr.write('token radar: board.json on disk does not start with the model\'s rank 1 row\n');
+  process.exit(1);
+}
+
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+    `token radar: model ${MODEL_VERSION}, risk tiers Low ${riskCounts.Low} / Medium ${riskCounts.Medium} / High ${riskCounts.High}\n` +
+    `token radar: top 5: ${board.slice(0, 5).map((r) => `#${r.rank} ${r.slug} $${r.implied_value_usd.toLocaleString('en-US')} [${r.model.risk_tier}]`).join(', ')}\n` +
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'model.json')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
